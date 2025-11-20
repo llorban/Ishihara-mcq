@@ -3,6 +3,7 @@ Multiple Choice Questions Strike Back
 
 ## What is this?
 A program that will convert AIKEN formatted multiple-choice test items into distorted image based label dragging questions. 
+![Ishihara MCQ sample](https://github.com/llorban/Ishihara-mcq/blob/a4085e31197912bbbd64512ce0d35d25a0d85a16/sample.png)
 
 ## Components
 ### conversion/aiken_converter.py
