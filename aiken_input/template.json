@@ -1,0 +1,7 @@
+{
+  "id": "plate001",            // optional, used for naming / metadata
+  "question": "Which number is hidden in the pattern?",
+  "options": ["A. 12", "B. 8", "C. 6", "D. 0"],
+  "correct_index": 0,          // optional: 0-based index
+  "seed": 1234567              // optional: reproducible random seed override
+}

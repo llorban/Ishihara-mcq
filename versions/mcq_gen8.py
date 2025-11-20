@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+generate_mcq_images_fontcontrols.py
+
+Generate 700x300 "Ishihara-style" MCQ plates (plain PNGs), with explicit
+font settings you can play with (auto-fit or fixed sizes).
+
+Usage examples:
+
+# Use built-in sample questions (12 plates)
+python generate_mcq_images_fontcontrols.py --count 12 --out plates_out --zip
+
+# Use CSV file with header: question,optA,optB,optC,optD
+python generate_mcq_images_fontcontrols.py --csv my_questions.csv --out plates_out --debug
+
+# Force question font size to 40 and option font size to 22 (px)
+python generate_mcq_images_fontcontrols.py --count 6 --q-font-size 40 --opt-font-size 22 --out plates_out
+
+# Disable auto-fit (i.e., use forced sizes or fallback)
+python generate_mcq_images_fontcontrols.py --no-auto-fit --q-font-size 48 --opt-font-size 20 --out plates_out
+
+Dependencies:
+  pip install pillow numpy
+"""
+
+import os, sys, argparse, textwrap, csv, json, random, zipfile
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import numpy as np
+# ---------- paste after imports ----------
+import scipy.ndimage as ndi   # pip install scipy
+from PIL import ImageOps
+
+def elastic_warp(mask_pil, alpha=24, sigma=6, seed=None):
+    """
+    Return a *warped* mask PIL image using random displacement fields.
+    alpha: max displacement magnitude (px)
+    sigma: smoothing (px)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+    shape = mask_np.shape
+    dx = ndi.gaussian_filter((np.random.rand(*shape) * 2 - 1), sigma) * alpha
+    dy = ndi.gaussian_filter((np.random.rand(*shape) * 2 - 1), sigma) * alpha
+    # build coordinate grid and displace
+    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    warped = ndi.map_coordinates(mask_np, [map_y.ravel(), map_x.ravel()], order=1, mode='reflect')
+    warped = warped.reshape(shape)
+    return Image.fromarray((np.clip(warped,0,1)*255).astype('uint8'), mode='L')
+
+def random_occlusions_on_mask(mask_pil, p=0.02, size_range=(2,8), seed=None):
+    """
+    Randomly erase tiny clusters in the mask to simulate occlusions.
+    p: fraction of mask pixels to consider for occlusion
+    size_range: radius range (px) for occluding circles
+    """
+    if seed is not None:
+        random.seed(seed)
+    mask = mask_pil.copy()
+    draw = ImageDraw.Draw(mask)
+    w,h = mask.size
+    total = int(w*h*p)
+    for _ in range(total):
+        cx = random.randint(0, w-1)
+        cy = random.randint(0, h-1)
+        r = random.randint(size_range[0], size_range[1])
+        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=0)
+    return mask
+
+def sample_fg_with_variation(mask_np, dot_positions, fg_color=(200,40,40),
+                             fg_size=8, color_jitter=14, seed=None, drop_chance=0.02):
+    """
+    Return list of (cx,cy, rr, rgba_color) for FG dots given candidate dot positions.
+    - mask_np: 2D numpy array (H x W) of mask values in [0..1]
+    - dot_positions: iterable of (cx,cy) pixel coordinates to consider
+    - fg_color: base RGB tuple
+    - fg_size: nominal radius in px
+    - color_jitter: +/- per-channel jitter
+    - seed: optional seed for deterministic randomness
+    - drop_chance: probability to randomly skip a foreground dot (simulates occlusion/noise)
+    """
+    if seed is not None:
+        random.seed(seed)
+    draws = []
+    h, w = mask_np.shape
+    for (cx, cy) in dot_positions:
+        # skip out-of-bounds gracefully
+        if cx < 0 or cy < 0 or cx >= w or cy >= h:
+            continue
+        v = mask_np[int(cy), int(cx)]
+        if v <= MASK_THRESHOLD:
+            continue
+        # randomly drop a small fraction of FG dots to introduce gaps
+        if drop_chance and (random.random() < float(drop_chance)):
+            continue
+        rr = fg_size + random.randint(-1, 1)  # slight size jitter
+        r = max(0, min(255, fg_color[0] + random.randint(-color_jitter, color_jitter)))
+        g = max(0, min(255, fg_color[1] + random.randint(-color_jitter, color_jitter)))
+        b = max(0, min(255, fg_color[2] + random.randint(-color_jitter, color_jitter)))
+        draws.append((cx, cy, rr, (r, g, b, 255)))
+    return draws
+
+# ---------------- Default visual/dot tuning (changeable) -----------------
+WIDTH, HEIGHT = 700, 300
+DOT_PITCH = 6        # smaller => denser
+JITTER = 1 
+BG_DOT_SIZE = 3
+FG_DOT_SIZE = 5 
+BG_PASSES = 4
+FG_PASSES = 3
+MASK_THRESHOLD = 0.22 # mask / placement
+
+# obfuscation
+ELASTIC_ALPHA = 0  # DISPLACEMENT SCALE (PX)
+ELASTIC_SIGMA = 1   # SMOOTHNESS (PX)
+OCCLUDE_P = 0.002   # FRACTION OF MASK PIXELS RANDOMLY ERASED (1.5%)
+OCCLUDE_SIZE_RANGE = (1, 3)
+ROTATE_DEG = 0.5    # SMALL ROTATION +/- DEG
+SHEAR_DEG = 0.5     # SMALL SHEAR +/- DEG
+
+# color jitter
+FG_COLOR_JITTER = 6  # +/- per channel
+BG_COLOR_JITTER = 6
+
+# enable saving/logging of per-plate random seed and obfuscation parameters
+LOG_SEED_AND_PARAMS = True
+
+# ------------------------------------------------------------------------
+
+# ---------------- Default font settings & search dirs -------------------
+FONT_SEARCH_DIRS = [
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+    os.path.expanduser("~/.fonts"),
+    os.path.expanduser("~/Library/Fonts"),
+    "C:\\Windows\\Fonts"
+]
+DEFAULT_Q_AREA_RATIO = 0.44   # fraction of height reserved for the question block
+OPTION_PADDING = 3            # bbox padding around detected option text
+Q_PADDING = 8                 # padding used when fitting question font
+# ------------------------------------------------------------------------
+
+def find_any_ttf(search_dirs=None):
+    search_dirs = search_dirs or FONT_SEARCH_DIRS
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for root, dirs, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith((".ttf", ".otf")):
+                        name = f.lower()
+                        # skip likely emoji/color fonts which can behave oddly
+                        if "emoji" in name or "color" in name:
+                            continue
+                        return os.path.join(root, f)
+        except PermissionError:
+            continue
+    return None
+
+def text_size(draw, text, font):
+    """Robust text measurement returning (w,h)."""
+    try:
+        bbox = draw.textbbox((0,0), text, font=font)
+        return (bbox[2]-bbox[0], bbox[3]-bbox[1])
+    except Exception:
+        try:
+            return font.getsize(text)
+        except Exception:
+            return (len(text)*8, getattr(font, "size", 12))
+
+def largest_fitting_truetype(lines, w, h, padding=8, font_path=None, max_hint=None):
+    """
+    Binary-search largest truetype font size that fits `lines` into w x h (approx).
+    Returns (ImageFont instance, chosen_size).
+    If font_path is None -> returns default PIL font (non-scalable).
+    max_hint optional ceiling (e.g. int(h*0.9)).
+    """
+    draw_tmp = ImageDraw.Draw(Image.new("L", (w, h)))
+    if font_path is None:
+        f = ImageFont.load_default()
+        return f, getattr(f, "size", 12)
+    lo, hi = 8, max_hint if max_hint else int(h * 1.2)
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            font = ImageFont.truetype(font_path, mid)
+        except Exception:
+            hi = mid - 1
+            continue
+        wmax = 0; hsum = 0
+        for ln in lines:
+            wln, hln = text_size(draw_tmp, ln, font)
+            wmax = max(wmax, wln)
+            hsum += hln + 4
+        if (wmax <= w - 2*padding) and (hsum <= h - 2*padding):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    try:
+        return ImageFont.truetype(font_path, best), best
+    except Exception:
+        f = ImageFont.load_default()
+        return f, getattr(f, "size", 12)
+
+def build_mask_and_boxes(question, options, font_path, auto_fit=True, q_forced_size=None, opt_forced_size=None, q_padding=Q_PADDING, option_padding=OPTION_PADDING):
+    """
+    Render the whole WIDTHxHEIGHT mask with question + options.
+    Returns: PIL L mask and list of option bounding boxes [ [x0,y0,x1,y1], ... ]
+    Behavior:
+      * If auto_fit True: pick largest font that fits question area and options area.
+      * If forced sizes provided (q_forced_size / opt_forced_size) they are used.
+    """
+    mask = Image.new("L", (WIDTH, HEIGHT), 0)
+    draw = ImageDraw.Draw(mask)
+
+    # --- question layout ---
+    q_lines = textwrap.wrap(question, width=60)
+    q_area_h = int(HEIGHT * DEFAULT_Q_AREA_RATIO)
+    opt_area_h = HEIGHT - q_area_h - 20
+
+    # choose question font
+    q_font = None
+    q_size = None
+    if q_forced_size:
+        try:
+            q_font = ImageFont.truetype(font_path, q_forced_size) if font_path else ImageFont.load_default()
+            q_size = q_forced_size
+        except Exception:
+            q_font = ImageFont.load_default()
+            q_size = getattr(q_font, "size", 12)
+    else:
+        if auto_fit:
+            q_font, q_size = largest_fitting_truetype(q_lines, WIDTH - 24, q_area_h, padding=q_padding, font_path=font_path, max_hint=int(q_area_h * 0.9))
+        else:
+            # fallback sized font
+            q_font = ImageFont.truetype(font_path, max(18, int(q_area_h * 0.12))) if font_path else ImageFont.load_default()
+            q_size = getattr(q_font, "size", 12)
+
+    # draw question centered at top block
+    y = 10
+    for ln in q_lines:
+        w, h = text_size(draw, ln, q_font)
+        draw.text(((WIDTH - w)//2, y), ln, fill=255, font=q_font)
+        y += h + 4
+
+    # --- options layout ---
+    per_row_h = int(opt_area_h / 4)
+    chosen_opt_font = None
+
+    if opt_forced_size:
+        try:
+            chosen_opt_font = ImageFont.truetype(font_path, opt_forced_size) if font_path else ImageFont.load_default()
+            opt_chosen_size = opt_forced_size
+        except Exception:
+            chosen_opt_font = ImageFont.load_default()
+            opt_chosen_size = getattr(chosen_opt_font, "size", 12)
+    else:
+        if auto_fit:
+            # try large -> small to find a single opt font size that fits all options into per_row_h
+            found = None
+            for size_test in range(48, 8, -1):
+                try:
+                    ftest = ImageFont.truetype(font_path, size_test) if font_path else ImageFont.load_default()
+                except Exception:
+                    ftest = ImageFont.load_default()
+                ok = True
+                for opt in options:
+                    lines_opt = textwrap.wrap(opt, width=40)
+                    hsum = 0
+                    for ln in lines_opt:
+                        _, hln = text_size(draw, ln, ftest)
+                        hsum += hln + 2
+                    if hsum > per_row_h - 8:
+                        ok = False
+                        break
+                if ok:
+                    found = ftest
+                    break
+            chosen_opt_font = found if found else (ImageFont.truetype(font_path, 14) if font_path else ImageFont.load_default())
+            opt_chosen_size = getattr(chosen_opt_font, "size", 14)
+        else:
+            chosen_opt_font = ImageFont.truetype(font_path, 14) if font_path else ImageFont.load_default()
+            opt_chosen_size = getattr(chosen_opt_font, "size", 14)
+
+    # draw options, left-aligned with bbox detection
+    base_y = y + 8
+    boxes = []
+    for i, opt in enumerate(options):
+        row_y = base_y + i * per_row_h
+        lines = textwrap.wrap(opt, width=40)
+        total_h = sum([text_size(draw, ln, chosen_opt_font)[1] + 2 for ln in lines])
+        inner_y = row_y + (per_row_h - total_h) // 2
+        min_x = WIDTH; min_y = HEIGHT; max_x = 0; max_y = 0
+        for ln in lines:
+            w, h = text_size(draw, ln, chosen_opt_font)
+            x = 20
+            draw.text((x, inner_y), ln, fill=255, font=chosen_opt_font)
+            min_x = min(min_x, x); min_y = min(min_y, inner_y)
+            max_x = max(max_x, x + w); max_y = max(max_y, inner_y + h)
+            inner_y += h + 2
+        boxes.append([max(0, min_x - option_padding), max(0, min_y - option_padding),
+                      min(WIDTH, max_x + option_padding), min(HEIGHT, max_y + option_padding)])
+
+    # final smoothing
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=1.0))
+
+    # debug info about chosen fonts/sizes
+    debug_info = {
+        "q_font_size": q_size,
+        "opt_font_size": opt_chosen_size,
+        "q_font_used": font_path or "PIL-default",
+        "q_area_h": q_area_h,
+        "per_row_h": per_row_h
+    }
+    return mask, boxes, debug_info
+
+def generate_plate_image(question, options, outpath, font_path, auto_fit=True, q_size_override=None, opt_size_override=None, debug=False):
+    # --- existing: mask, boxes = build_mask_and_option_boxes(...)
+    mask, boxes, debug_info = build_mask_and_boxes(question, options, font_path, auto_fit=auto_fit, q_forced_size=q_size_override, opt_forced_size=opt_size_override)
+    # create a reproducible seed and log it for debugging
+    seed = random.randint(0, 2**31 - 1)
+    if LOG_SEED_AND_PARAMS:
+        # append or save a small JSON later per-plate (we'll add after saving)
+        debug_info['seed'] = seed
+        meta = {
+          "question": question,
+          "options": options,
+          "boxes": boxes,
+          "font_info": debug_info,
+          "seed": seed,
+          "obfuscation": {
+            "ELASTIC_ALPHA": ELASTIC_ALPHA,
+            "ELASTIC_SIGMA": ELASTIC_SIGMA,
+            "OCCLUDE_P": OCCLUDE_P,
+            "FG_PASSES": FG_PASSES,
+            "FG_COLOR_JITTER": FG_COLOR_JITTER,
+            "ROTATE_DEG": ROTATE_DEG,
+            "SHEAR_DEG": SHEAR_DEG
+          }
+        }
+        # save as before
+
+    # 1) elastic warp (non-linear displacement) to mask
+    mask = elastic_warp(mask, alpha=ELASTIC_ALPHA, sigma=ELASTIC_SIGMA, seed=seed)
+    # 2) random tiny occlusions (erase small circles)
+    mask = random_occlusions_on_mask(mask, p=OCCLUDE_P, size_range=OCCLUDE_SIZE_RANGE, seed=seed)
+    # then sample mask into float array used for dot selection
+    mask_np = np.array(mask).astype(float) / 255.0
+
+    # optionally save debug mask if requested (keep your debug behavior)
+    if debug:
+        mask.save(outpath.replace(".png", "_mask.png"))
+
+    # background
+    bg = Image.new("RGB", (WIDTH, HEIGHT), (240,240,240))
+    for pass_i in range(BG_PASSES):
+        draw_bg = ImageDraw.Draw(bg)
+        offset_x = (pass_i * (DOT_PITCH // 3)) % DOT_PITCH
+        offset_y = (pass_i * (DOT_PITCH // 5)) % DOT_PITCH
+        cols = int(WIDTH / DOT_PITCH) + 2
+        rows = int(HEIGHT / DOT_PITCH) + 2
+        for r in range(rows):
+            for c in range(cols):
+                cx = int(c * DOT_PITCH + DOT_PITCH/2 + offset_x - (cols*DOT_PITCH - WIDTH)/2)
+                cy = int(r * DOT_PITCH + DOT_PITCH/2 + offset_y - (rows*DOT_PITCH - HEIGHT)/2)
+                jx = cx + random.randint(-JITTER, JITTER)
+                jy = cy + random.randint(-JITTER, JITTER)
+                if not (0 <= jx < WIDTH and 0 <= jy < HEIGHT): continue
+                rr = BG_DOT_SIZE
+                col = (180 + ((r+c+pass_i) % 3)*10, 180 + ((r+c+pass_i)%3)*6, 60 + ((r+c+pass_i)%3)*20)
+                draw_bg.ellipse([jx-rr/2, jy-rr/2, jx+rr/2, jy+rr/2], fill=col, outline=None)
+
+    # --------- foreground: multi-pass sampling with color/size jitter & occasional drops ----------
+    fg = Image.new("RGBA", (WIDTH, HEIGHT), (0,0,0,0))
+    draw_fg = ImageDraw.Draw(fg)
+    cols = int(WIDTH / DOT_PITCH) + 2
+    rows = int(HEIGHT / DOT_PITCH) + 2
+
+    # build base candidate dot positions once
+    base_positions = []
+    for r in range(rows):
+        for c in range(cols):
+            cx = int(c * DOT_PITCH + DOT_PITCH/2 - (cols*DOT_PITCH - WIDTH)/2)
+            cy = int(r * DOT_PITCH + DOT_PITCH/2 - (rows*DOT_PITCH - HEIGHT)/2)
+            base_positions.append((cx, cy))
+
+    # multiple passes with slight offsets to reduce aliasing + increase fill
+    for pass_i in range(FG_PASSES):
+        offset_x = (pass_i * (DOT_PITCH // 3)) % DOT_PITCH
+        offset_y = (pass_i * (DOT_PITCH // 5)) % DOT_PITCH
+        # build pass positions with offset (so slightly different samples each pass)
+        pass_positions = [(x + offset_x, y + offset_y) for (x, y) in base_positions]
+        # sample draws for this pass
+        draw_cmds = sample_fg_with_variation(mask_np, pass_positions,
+                                            fg_color=(200, 40, 40),
+                                            fg_size=FG_DOT_SIZE,
+                                            color_jitter=FG_COLOR_JITTER,
+                                            seed=seed + pass_i, drop_chance=0.02)
+        # render draws
+        for (cx, cy, rr, color) in draw_cmds:
+            draw_fg.ellipse([cx-rr/2, cy-rr/2, cx+rr/2, cy+rr/2], fill=color, outline=None)
+    # save fg debug if requested
+    if debug:
+        fg.convert("RGB").save(outpath.replace(".png", "_fg.png"))
+    # ------------------------------------------------------------------------
+
+    composite = Image.alpha_composite(bg.convert("RGBA"), fg).convert("RGB")
+    # small global transform to further break exact text geometry
+    angle = random.uniform(-ROTATE_DEG, ROTATE_DEG)
+    shear = random.uniform(-SHEAR_DEG, SHEAR_DEG)
+    composite = composite.rotate(angle, resample=Image.BICUBIC, expand=False)
+    # shear via AFFINE matrix (approx): (a, b, c, d, e, f) maps
+    composite = composite.transform((WIDTH, HEIGHT), Image.AFFINE,
+                                    (1, np.tan(np.radians(shear)), 0, 0, 1, 0),
+                                    resample=Image.BICUBIC)
+    composite.save(outpath)
+    if debug:
+        mask.save(outpath.replace(".png", "_mask.png"))
+        bg.save(outpath.replace(".png", "_bg.png"))
+        fg.convert("RGB").save(outpath.replace(".png", "_fg.png"))
+    return boxes, debug_info
+
+def load_questions_from_csv(csv_path):
+    rows = []
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            q = r.get('question') or r.get('Question') or ""
+            opts = [
+                r.get('optA') or r.get('A') or r.get('opt1') or r.get('optionA') or r.get('option1') or "",
+                r.get('optB') or r.get('B') or r.get('opt2') or r.get('optionB') or r.get('option2') or "",
+                r.get('optC') or r.get('C') or r.get('opt3') or r.get('optionC') or r.get('option3') or "",
+                r.get('optD') or r.get('D') or r.get('opt4') or r.get('optionD') or r.get('option4') or ""
+            ]
+            rows.append((q, opts))
+    return rows
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate MCQ plates with font controls")
+    parser.add_argument("--count", type=int, default=12)
+    parser.add_argument("--out", default="plates_out")
+    parser.add_argument("--csv", help="CSV file with header (question,optA,optB,optC,optD). If absent, sample questions are used.")
+    parser.add_argument("--zip", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="Also save mask/bg/fg for each plate")
+    parser.add_argument("--font-path", help="Explicit TTF/OTF path to use for all rendering (overrides auto-detect)")
+    parser.add_argument("--auto-fit-fonts", dest="auto_fit", action="store_true", help="Auto-fit fonts to available space (default)")
+    parser.add_argument("--no-auto-fit", dest="auto_fit", action="store_false", help="Disable auto-fit; uses forced sizes or reasonable defaults")
+    parser.add_argument("--q-font-size", type=int, help="Force question font absolute size (px); overrides auto-fit if provided")
+    parser.add_argument("--opt-font-size", type=int, help="Force options font absolute size (px); overrides auto-fit if provided")
+    parser.set_defaults(auto_fit=True)
+    args = parser.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+
+    # find font if not provided
+    font_path = args.font_path or find_any_ttf()
+    if font_path:
+        print("Using TTF font:", font_path)
+    else:
+        print("WARNING: No TTF/OTF found in search dirs. PIL default font will be used (likely small).", file=sys.stderr)
+        font_path = None
+
+    if args.csv:
+        questions = load_questions_from_csv(args.csv)
+        if not questions:
+            print("CSV was read but found no rows. Exiting.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        sample = [
+            ("Which number is hidden in the pattern?", ["A. 12", "B. 8", "C. 6", "D. 0"]),
+            ("Select the number shown in the colored dots.", ["A. 71", "B. 74", "C. 77", "D. 78"]),
+            ("What word appears in the plate?", ["A. HELLO", "B. WORLD", "C. TEST", "D. PLATE"]),
+            ("Which digit is represented?", ["A. 3", "B. 5", "C. 9", "D. 2"]),
+            ("Identify the letter shown in the left panel.", ["A. A", "B. B", "C. C", "D. D"]),
+            ("Which number is embedded in the design?", ["A. 24", "B. 42", "C. 48", "D. 62"]),
+            ("Which option is highlighted?", ["A. RED", "B. BLUE", "C. GREEN", "D. YELLOW"]),
+            ("Pick the correct label in the dots.", ["A. CAT", "B. DOG", "C. BIRD", "D. FISH"]),
+            ("Which month is spelled in dots?", ["A. MAY", "B. JUNE", "C. JULY", "D. AUG"]),
+            ("Which shape name appears?", ["A. CIRCLE", "B. SQUARE", "C. TRIANGLE", "D. OVAL"]),
+            ("What does the plate show?", ["A. SUN", "B. MOON", "C. STAR", "D. CLOUD"]),
+            ("Which letter is hidden?", ["A. X", "B. Y", "C. Z", "D. W"]),
+        ]
+        questions = sample[:max(1, min(len(sample), args.count))]
+
+    written = []
+    for i, (qtext, opts) in enumerate(questions, start=1):
+        name = f"plate_{i:02d}.png"
+        outpath = os.path.join(args.out, name)
+        print("Rendering", name, "...")
+        boxes, info = generate_plate_image(qtext, opts, outpath, font_path=font_path,
+                                           auto_fit=args.auto_fit,
+                                           q_size_override=args.q_font_size,
+                                           opt_size_override=args.opt_font_size,
+                                           debug=args.debug)
+        written.append(outpath)
+        # write a small JSON meta for each plate (useful later)
+        meta = {"question": qtext, "options": opts, "boxes": boxes, "font_info": info}
+        with open(outpath.replace(".png", ".json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        print(f" Wrote {outpath}   (options bboxes: {boxes})  font_info: {info}")
+
+    if args.zip:
+        zipname = os.path.join(args.out, "plates.zip")
+        with zipfile.ZipFile(zipname, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for pth in written:
+                zf.write(pth, arcname=os.path.basename(pth))
+        print("Wrote ZIP:", zipname)
+
+    print("Done. Open the output folder to upload PNGs into Moodle.")
+    print("Validation tips: view masks (if --debug) at 100% zoom to confirm text sizes; adjust --q-font-size / --opt-font-size or toggle --no-auto-fit if needed.")
+
+if __name__ == "__main__":
+    main()
